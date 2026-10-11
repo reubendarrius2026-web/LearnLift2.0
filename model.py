@@ -7,7 +7,8 @@ import numpy as np
 import pandas as pd
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import accuracy_score, recall_score
-from sklearn.model_selection import train_test_split
+from sklearn.metrics import precision_score
+from sklearn.model_selection import StratifiedKFold, train_test_split
 
 FEATURES = ["attendance_pct", "avg_score", "assignment_completion",
             "study_hours_week", "has_internet", "has_device"]
@@ -36,6 +37,49 @@ def fairness_audit(test_df):
                 "recall (at-risk caught)": round(recall_score(sub.at_risk, sub.pred), 3),
             })
     return pd.DataFrame(rows)
+
+
+def oof_probabilities(df, seed=42):
+    """Out-of-fold risk scores for every student (each student is scored by a model that
+    never saw them). Gives the fairness audit all students instead of a small test set."""
+    kf = StratifiedKFold(5, shuffle=True, random_state=seed)
+    proba = np.zeros(len(df))
+    for tr, te in kf.split(df, df["at_risk"]):
+        m = RandomForestClassifier(n_estimators=100, class_weight="balanced", random_state=seed)
+        m.fit(df.iloc[tr][FEATURES], df.iloc[tr]["at_risk"])
+        proba[te] = m.predict_proba(df.iloc[te][FEATURES])[:, 1]
+    return proba
+
+
+def fairness_report(df, proba, threshold=0.5):
+    """Returns (group_table, verdicts, overall). Recall = share of truly at-risk students the
+    model catches. A gap is only flagged if it is bigger than random noise would explain."""
+    d = df.assign(pred=(proba >= threshold).astype(int))
+    overall = {
+        "recall": recall_score(d.at_risk, d.pred),
+        "precision": precision_score(d.at_risk, d.pred),
+        "accuracy": accuracy_score(d.at_risk, d.pred),
+    }
+    rows = []
+    for col in AUDIT_COLS:
+        for g, sub in d.groupby(col):
+            n_pos = int(sub.at_risk.sum())
+            rows.append({"attribute": col, "group": g, "students": len(sub),
+                         "at_risk": n_pos, "flagged": sub.pred.mean(),
+                         "caught": recall_score(sub.at_risk, sub.pred),
+                         "se": (0 if n_pos == 0 else
+                                (recall_score(sub.at_risk, sub.pred) *
+                                 (1 - recall_score(sub.at_risk, sub.pred)) / n_pos) ** 0.5)})
+    table = pd.DataFrame(rows)
+
+    verdicts = []
+    for col, sub in table.groupby("attribute"):
+        hi, lo = sub.loc[sub.caught.idxmax()], sub.loc[sub.caught.idxmin()]
+        gap = hi.caught - lo.caught
+        noise = (hi.se ** 2 + lo.se ** 2) ** 0.5
+        verdicts.append({"attribute": col, "gap": gap, "highest": hi.group, "lowest": lo.group,
+                         "needs_attention": bool(gap > 0.05 and gap > 2 * noise)})
+    return table, verdicts, overall
 
 
 def recommend(s):

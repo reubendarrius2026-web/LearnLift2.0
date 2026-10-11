@@ -3,7 +3,8 @@ import streamlit as st
 
 import db
 from data import generate
-from model import FEATURES, train, fairness_audit, recommend, explain, reference_profile
+from model import (FEATURES, train, recommend, explain, reference_profile,
+                   oof_probabilities, fairness_report)
 
 st.set_page_config(page_title="LearnLift", page_icon="🎓")
 st.title("🎓 LearnLift")
@@ -13,11 +14,11 @@ st.caption("Identify support needs early - not label students.")
 @st.cache_resource
 def get_model():
     df = generate()
-    model, metrics, test_df = train(df)
-    return model, metrics, test_df, reference_profile(df)
+    model, metrics, _ = train(df)
+    return model, metrics, df, oof_probabilities(df), reference_profile(df)
 
 
-model, metrics, test_df, ref = get_model()
+model, metrics, audit_df, audit_proba, ref = get_model()
 db.init()
 tab1, tab2, tab3 = st.tabs(["Student support", "Fairness audit", "Class dashboard"])
 
@@ -67,10 +68,51 @@ with tab1:
             st.error("Enter a student ID first.")
 
 with tab2:
-    st.write(f"Model accuracy: **{metrics['accuracy']:.0%}**, recall: **{metrics['recall']:.0%}**")
-    st.write("Income, region and gender are **not** model inputs. They are only used here to check "
-             "whether the model works equally well across groups.")
-    st.dataframe(fairness_audit(test_df), width="stretch")
+    st.subheader("Does the model work equally well for every group?")
+    st.write("Income, region and gender are **not** model inputs. They are used only here, to check "
+             "whether students in different groups get the same chance of being noticed. "
+             "**'At-risk caught'** is the share of students who truly need help that the model flags.")
+
+    thr = st.slider("Flagging threshold: flag a student when their score is at least", 0.20, 0.70, 0.50, 0.05,
+                    format="%.2f",
+                    help="Lower = catches more students who need help, but also more false alarms.")
+    table, verdicts, overall = fairness_report(audit_df, audit_proba, thr)
+
+    m1, m2, m3 = st.columns(3)
+    m1.metric("At-risk students caught", f"{overall['recall']:.0%}")
+    m2.metric("Flags that were right", f"{overall['precision']:.0%}")
+    m3.metric("Overall accuracy", f"{overall['accuracy']:.0%}")
+    st.caption("Lowering the threshold catches more students in need, at the cost of more false alarms.")
+
+    st.markdown("**Verdict**")
+    names = {"income_band": "Income", "region": "Region", "gender": "Gender"}
+    for v in verdicts:
+        line = (f"{names[v['attribute']]}: {v['gap'] * 100:.0f}-point gap in students caught "
+                f"({v['highest']} highest, {v['lowest']} lowest)")
+        if v["needs_attention"]:
+            st.warning("⚠️ " + line + ". Larger than random variation, so this needs attention.")
+        else:
+            st.success("✅ " + line + ". Within normal variation.")
+
+    chart = table.assign(label=table.attribute.map(names) + ": " + table.group.astype(str))
+    chart = chart.set_index("label")[["caught"]].mul(100).rename(columns={"caught": "At-risk students caught (%)"})
+    st.bar_chart(chart)
+
+    with st.expander("See the full table"):
+        show = table.assign(attribute=table.attribute.map(names))[
+            ["attribute", "group", "students", "at_risk", "flagged", "caught"]]
+        show = show.rename(columns={"attribute": "Attribute", "group": "Group", "students": "Students",
+                                    "at_risk": "At-risk students", "flagged": "Flagged",
+                                    "caught": "At-risk caught"})
+        show["Flagged"] = (show["Flagged"] * 100).round(0)
+        show["At-risk caught"] = (show["At-risk caught"] * 100).round(0)
+        st.dataframe(show, width="stretch", hide_index=True, column_config={
+            "Flagged": st.column_config.NumberColumn(format="%d%%"),
+            "At-risk caught": st.column_config.NumberColumn(format="%d%%")})
+        st.caption("More low-income and rural students are flagged because they face more barriers. "
+                   "That is expected. The important column is 'At-risk caught'.")
+    st.caption("Scores come from out-of-fold predictions on all 2,000 students. Small groups give "
+               "noisy results, and this data is synthetic, so real data is needed to confirm.")
 
 with tab3:
     st.write("Saved students, with the highest support need first.")
